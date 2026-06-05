@@ -79,14 +79,15 @@ def test_read_receipts(server):
 
 
 def test_offline_queue_on_reconnect(server):
-    """7. Offline user receives messages in offline queue on reconnect."""
+    """7. Offline user receives messages in offline queue, flushed to inbox on reconnect."""
     server.connect("alice", current_time=0.0)
     server.connect("bob", current_time=0.0)
     server.disconnect("bob", current_time=1.0)
     server.send_message("alice", "bob", "Are you there?", current_time=2.0)
     assert len(server.connections["bob"].offline_queue) == 1
     server.connect("bob", current_time=3.0)
-    assert len(server.connections["bob"].offline_queue) >= 1
+    assert len(server.connections["bob"].offline_queue) == 0
+    assert any(m.content == "Are you there?" for m in server.connections["bob"].inbox)
 
 
 def test_status_transitions(server):
@@ -174,3 +175,40 @@ def test_typing_indicators(server):
     assert "alice" in server.get_typing_users(conv_id, current_time=10.0)
     server.clear_typing("alice", conv_id)
     assert "alice" not in server.get_typing_users(conv_id, current_time=10.0)
+
+
+def test_sender_unread_count_is_zero(server):
+    """Sender's own messages don't count as unread for the sender."""
+    server.connect("alice", current_time=0.0)
+    server.connect("bob", current_time=0.0)
+    server.send_message("alice", "bob", "Hello", current_time=1.0)
+    server.send_message("alice", "bob", "Hello again", current_time=2.0)
+    conv_id = server.connections["bob"].inbox[0].conversation_id
+    assert server.get_unread_count("alice", conv_id) == 0
+    assert server.get_unread_count("bob", conv_id) == 2
+
+
+def test_presence_notification_on_connect(server):
+    """Contacts receive presence notification when a user comes online."""
+    server.connect("alice", current_time=0.0)
+    server.connect("bob", current_time=0.0)
+    server.send_message("alice", "bob", "Hi", current_time=1.0)
+    alice_inbox_before = len(server.connections["alice"].inbox)
+    server.disconnect("bob", current_time=2.0)
+    server.connect("bob", current_time=3.0)
+    new_msgs = server.connections["alice"].inbox[alice_inbox_before:]
+    assert any("offline" in m.content for m in new_msgs)
+    assert any("online" in m.content for m in new_msgs)
+
+
+def test_get_conversations_uses_index(server):
+    """get_conversations returns all conversations a user participates in."""
+    server.connect("alice", current_time=0.0)
+    server.connect("bob", current_time=0.0)
+    server.connect("charlie", current_time=0.0)
+    server.send_message("alice", "bob", "Hi bob", current_time=1.0)
+    gid = server.create_group("alice", "Group", ["charlie"], current_time=2.0)
+    convs = server.get_conversations("alice")
+    assert len(convs) == 2
+    conv_ids = {c.conversation_id for c in convs}
+    assert gid in conv_ids

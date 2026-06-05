@@ -76,6 +76,7 @@ class ChatServer:
         self.typing: dict[tuple, float] = {}  # (user_id, conv_id) -> timestamp
         self.lamport_clock: int = 0
         self.contacts: dict[str, set] = {}  # user_id -> set of contact user_ids
+        self.user_conversations: dict[str, set] = {}  # user_id -> set of conversation_ids
 
     def _get_or_create_connection(self, user_id: str) -> UserConnection:
         if user_id not in self.connections:
@@ -97,21 +98,48 @@ class ChatServer:
     # -- Connection management --
 
     def connect(self, user_id: str, current_time: float = None):
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         conn = self._get_or_create_connection(user_id)
         conn.status = UserStatus.ONLINE
         conn.last_active = current_time
         conn.connected_at = current_time
+        # Flush offline queue to inbox
+        if conn.offline_queue:
+            conn.inbox.extend(conn.offline_queue)
+            conn.offline_queue.clear()
+        # Notify contacts of presence change
+        for contact_id in self.contacts.get(user_id, set()):
+            contact = self._get_or_create_connection(contact_id)
+            if contact.status in (UserStatus.ONLINE, UserStatus.AWAY):
+                contact.inbox.append(Message(
+                    message_id=str(uuid.uuid4()),
+                    conversation_id=self._dm_conversation_id(user_id, contact_id),
+                    sender_id=user_id,
+                    content=f"{user_id} is now online",
+                    message_type=MessageType.SYSTEM,
+                    timestamp=current_time,
+                ))
 
     def disconnect(self, user_id: str, current_time: float = None):
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         conn = self._get_or_create_connection(user_id)
         conn.status = UserStatus.OFFLINE
         conn.last_active = current_time
         conn.connected_at = None
+        for contact_id in self.contacts.get(user_id, set()):
+            contact = self._get_or_create_connection(contact_id)
+            if contact.status in (UserStatus.ONLINE, UserStatus.AWAY):
+                contact.inbox.append(Message(
+                    message_id=str(uuid.uuid4()),
+                    conversation_id=self._dm_conversation_id(user_id, contact_id),
+                    sender_id=user_id,
+                    content=f"{user_id} is now offline",
+                    message_type=MessageType.SYSTEM,
+                    timestamp=current_time,
+                ))
 
     def heartbeat(self, user_id: str, current_time: float = None):
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         conn = self._get_or_create_connection(user_id)
         conn.last_active = current_time
         if conn.status != UserStatus.OFFLINE:
@@ -139,7 +167,7 @@ class ChatServer:
     def send_message(self, sender_id: str, recipient_id: str, content: str,
                      message_type: MessageType = MessageType.TEXT,
                      current_time: float = None) -> Message:
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         conv_id = self._dm_conversation_id(sender_id, recipient_id)
 
         if conv_id not in self.conversations:
@@ -171,12 +199,17 @@ class ChatServer:
         # Update sender activity
         self._get_or_create_connection(sender_id).last_active = current_time
 
+        # Sender's own messages are always read
+        self.read_cursors[(sender_id, conv_id)] = seq
+
         # Deliver to recipient
         self._deliver(recipient_id, msg)
 
-        # Add contacts
+        # Add contacts and conversation index
         self.contacts.setdefault(sender_id, set()).add(recipient_id)
         self.contacts.setdefault(recipient_id, set()).add(sender_id)
+        self.user_conversations.setdefault(sender_id, set()).add(conv_id)
+        self.user_conversations.setdefault(recipient_id, set()).add(conv_id)
 
         return msg
 
@@ -184,7 +217,7 @@ class ChatServer:
 
     def create_group(self, creator_id: str, name: str, member_ids: list[str],
                      current_time: float = None) -> str:
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         group_id = f"group:{uuid.uuid4()}"
         members = set(member_ids) | {creator_id}
 
@@ -201,12 +234,14 @@ class ChatServer:
             is_group=True,
             participants=set(members),
         )
+        for mid in members:
+            self.user_conversations.setdefault(mid, set()).add(group_id)
         return group_id
 
     def send_group_message(self, sender_id: str, group_id: str, content: str,
                            message_type: MessageType = MessageType.TEXT,
                            current_time: float = None) -> Message:
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         group = self.groups[group_id]
         if sender_id not in group.members:
             raise ValueError("Sender is not a member of this group")
@@ -230,6 +265,7 @@ class ChatServer:
         self.messages[msg.message_id] = msg
 
         self._get_or_create_connection(sender_id).last_active = current_time
+        self.read_cursors[(sender_id, group_id)] = seq
 
         for member_id in group.members:
             if member_id != sender_id:
@@ -243,6 +279,7 @@ class ChatServer:
             raise ValueError("Group size limit reached (500)")
         group.members.add(user_id)
         self.conversations[group_id].participants.add(user_id)
+        self.user_conversations.setdefault(user_id, set()).add(group_id)
 
         # System message
         sys_msg = Message(
@@ -316,9 +353,9 @@ class ChatServer:
                 page = list(reversed(msgs[start:end]))
                 next_cursor = msgs[start].sequence_number if start > 0 else None
             else:
-                page = msgs[:limit]
-                next_cursor = msgs[min(limit, len(msgs)) - 1].sequence_number if limit < len(msgs) else None
-                # Actually return in forward order
+                end = min(limit, len(msgs))
+                page = msgs[:end]
+                next_cursor = page[-1].sequence_number if end < len(msgs) else None
         else:
             # Find cursor position using sequence numbers
             seq_nums = [m.sequence_number for m in msgs]
@@ -360,7 +397,7 @@ class ChatServer:
     # -- Typing indicators --
 
     def set_typing(self, user_id: str, conversation_id: str, current_time: float = None):
-        current_time = current_time or 0.0
+        current_time = current_time if current_time is not None else 0.0
         self.typing[(user_id, conversation_id)] = current_time
 
     def clear_typing(self, user_id: str, conversation_id: str):
@@ -392,4 +429,5 @@ class ChatServer:
     # -- Conversations --
 
     def get_conversations(self, user_id: str) -> list[Conversation]:
-        return [c for c in self.conversations.values() if user_id in c.participants]
+        conv_ids = self.user_conversations.get(user_id, set())
+        return [self.conversations[cid] for cid in conv_ids if cid in self.conversations]
