@@ -203,3 +203,60 @@ def test_multiple_followers_receive_post():
         feed = svc.get_feed(f)
         assert len(feed) == 1
         assert feed[0].post.post_id == post.post_id
+
+
+# 16. Follow backfills cache with existing posts
+def test_follow_backfills_cache():
+    svc = NewsFeedService(strategy=FeedStrategy.FAN_OUT_ON_WRITE)
+    svc.create_post("bob", "Post 1", created_at=1000.0)
+    svc.create_post("bob", "Post 2", created_at=2000.0)
+    svc.follow("alice", "bob")
+    feed = svc.get_feed("alice")
+    assert len(feed) == 2
+    assert feed[0].post.created_at == 2000.0
+
+
+# 17. Unfollow with deleted post doesn't crash
+def test_unfollow_with_deleted_post():
+    svc = NewsFeedService(strategy=FeedStrategy.FAN_OUT_ON_WRITE)
+    svc.follow("alice", "bob")
+    post = svc.create_post("bob", "Post 1", created_at=1000.0)
+    del svc.post_store._posts[post.post_id]
+    svc.unfollow("alice", "bob")
+    assert len(svc.get_feed("alice")) == 0
+
+
+# 18. Like returns result and prevents double-like
+def test_like_returns_result():
+    svc = NewsFeedService()
+    post = svc.create_post("bob", "Post", created_at=1000.0)
+    result1 = svc.post_store.like_post("alice", post.post_id)
+    assert result1 is True
+    result2 = svc.post_store.like_post("alice", post.post_id)
+    assert result2 is False
+    assert post.likes_count == 1
+
+
+# 19. Comment returns the Comment object
+def test_comment_returns_object():
+    svc = NewsFeedService()
+    post = svc.create_post("bob", "Post", created_at=1000.0)
+    comment = svc.post_store.add_comment("alice", post.post_id, "Nice!", created_at=2000.0)
+    assert comment.author_id == "alice"
+    assert comment.content == "Nice!"
+    assert comment.post_id == post.post_id
+
+
+# 20. Fan-out-on-read merges multiple users correctly
+def test_pull_merges_multiple_users():
+    svc = NewsFeedService(strategy=FeedStrategy.FAN_OUT_ON_READ)
+    svc.follow("alice", "bob")
+    svc.follow("alice", "charlie")
+    svc.create_post("bob", "Bob 1", created_at=1000.0)
+    svc.create_post("charlie", "Charlie 1", created_at=1500.0)
+    svc.create_post("bob", "Bob 2", created_at=2000.0)
+    feed = svc.get_feed("alice")
+    assert len(feed) == 3
+    assert feed[0].post.created_at == 2000.0
+    assert feed[1].post.created_at == 1500.0
+    assert feed[2].post.created_at == 1000.0

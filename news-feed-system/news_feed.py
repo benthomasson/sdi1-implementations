@@ -136,7 +136,7 @@ class PostStore:
 class NewsFeedService:
     """News feed service supporting push, pull, and hybrid strategies."""
 
-    RELEVANCE_WEIGHT = 0.1
+    RELEVANCE_WEIGHT = 50.0
 
     def __init__(self, strategy: FeedStrategy = FeedStrategy.FAN_OUT_ON_WRITE,
                  ranking: RankingMode = RankingMode.CHRONOLOGICAL,
@@ -153,6 +153,10 @@ class NewsFeedService:
 
     def follow(self, follower_id: str, followee_id: str):
         self.graph.follow(follower_id, followee_id)
+        if self.strategy in (FeedStrategy.FAN_OUT_ON_WRITE, FeedStrategy.HYBRID):
+            if self.graph.get_follower_count(followee_id) <= self.celebrity_threshold:
+                for post in self.post_store.get_user_posts(followee_id, limit=self.cache_size):
+                    self._feed_cache[follower_id].append(post.post_id)
 
     def unfollow(self, follower_id: str, followee_id: str):
         self.graph.unfollow(follower_id, followee_id)
@@ -163,8 +167,11 @@ class NewsFeedService:
     def _remove_author_from_cache(self, user_id: str, author_id: str):
         """Remove all posts by author_id from user_id's feed cache."""
         cache = self._feed_cache[user_id]
-        filtered = [pid for pid in cache
-                    if self.post_store.get_post(pid).author_id != author_id]
+        filtered = []
+        for pid in cache:
+            post = self.post_store.get_post(pid)
+            if post and post.author_id != author_id:
+                filtered.append(pid)
         cache.clear()
         cache.extend(filtered)
 
