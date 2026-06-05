@@ -96,11 +96,12 @@ def test_frontier_dfs_order():
 def test_crawler_max_pages():
     web = SimulatedWeb()
     for i in range(20):
-        links = [f"https://example.com/page{j}" for j in range(20) if j != i]
+        targets = [(i + 1 + j) % 20 for j in range(3)]
+        links = [f"https://example.com/page{t}" for t in targets]
         web.add_page(WebPage(
             url=f"https://example.com/page{i}",
             content=f"<html>Page {i} unique content {i*17}</html>",
-            links=links[:3],
+            links=links,
         ))
     crawler = Crawler(web=web, seeds=["https://example.com/page0"], max_pages=5, politeness_delay=0)
     stats = crawler.crawl()
