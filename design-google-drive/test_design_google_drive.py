@@ -124,10 +124,14 @@ def test_conflict_detection():
 def test_conflict_keep_both():
     store = FileStore()
     f = store.upload_file("doc.txt", b"original", "u1", current_time=100.0)
-    store.update_file(f.file_id, b"edited", "u1", device_id="phone", current_time=200.0)
-    copy = store.resolve_conflict(f.file_id, strategy="keep_both", user_id="u1", current_time=201.0)
+    store.update_file(f.file_id, b"phone edit", "u1", device_id="phone", current_time=200.0)
+    laptop_content = b"laptop edit"
+    copy = store.resolve_conflict(f.file_id, strategy="keep_both", user_id="u1",
+                                  current_time=201.0, conflicting_content=laptop_content)
     assert "(conflict)" in copy.name
     assert copy.file_id != f.file_id
+    content, _ = store.download_file(copy.file_id, "u1")
+    assert content == laptop_content
 
 
 def test_quota_enforcement():
@@ -184,6 +188,54 @@ def test_move_and_rename():
     assert store.get_path(f.file_id) == "/b/test.txt"
     store.rename_file(f.file_id, "renamed.txt", "user1")
     assert store.get_path(f.file_id) == "/b/renamed.txt"
+
+
+def test_recursive_folder_delete():
+    """Deleting a folder cascades to its children."""
+    store = FileStore()
+    parent = store.create_folder("parent", "user1")
+    child = store.create_folder("child", "user1", parent_folder_id=parent.file_id)
+    f = store.upload_file("deep.txt", b"data", "user1", parent_folder_id=child.file_id)
+    store.delete_file(parent.file_id, "user1", current_time=100.0)
+    assert store.files[child.file_id].is_deleted
+    assert store.files[f.file_id].is_deleted
+
+
+def test_move_checks_destination_permission():
+    """Cannot move a file into a folder the user doesn't have WRITE on."""
+    store = FileStore()
+    src = store.create_folder("src", "user1")
+    dst = store.create_folder("dst", "user2")
+    f = store.upload_file("test.txt", b"data", "user1", parent_folder_id=src.file_id)
+    with pytest.raises(PermissionError):
+        store.move_file(f.file_id, dst.file_id, "user1")
+
+
+def test_chunked_upload_reserves_quota():
+    """Chunked upload reserves quota upfront and releases on abort."""
+    store = FileStore(default_quota_bytes=500)
+    uid = store.init_chunked_upload("big.bin", 400, 200, "user1")
+    used, _ = store.get_usage("user1")
+    assert used == 400
+    # Can't upload another file that exceeds remaining quota
+    with pytest.raises(ValueError):
+        store.upload_file("extra.txt", b"x" * 200, "user1")
+    store.abort_chunked_upload(uid)
+    used_after, _ = store.get_usage("user1")
+    assert used_after == 0
+
+
+def test_conflict_detection_uses_version_vectors():
+    """Conflict detection uses version vectors, not just version counter."""
+    store = FileStore()
+    f = store.upload_file("doc.txt", b"v1", "u1", current_time=100.0)
+    # Same device edits twice — no conflict for that device
+    store.update_file(f.file_id, b"v2", "u1", device_id="phone", current_time=200.0)
+    store.update_file(f.file_id, b"v3", "u1", device_id="phone", current_time=300.0)
+    # Phone knows about its own edits, no conflict
+    assert store.detect_conflict(f.file_id, "phone", base_version=1) is False
+    # Laptop hasn't edited, but phone has — conflict for laptop
+    assert store.detect_conflict(f.file_id, "laptop", base_version=1) is True
 
 
 def test_api_spec_example():
