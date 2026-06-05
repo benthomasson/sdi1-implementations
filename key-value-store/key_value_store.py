@@ -2,7 +2,6 @@
 
 import hashlib
 import random
-import time
 from dataclasses import dataclass, field
 
 
@@ -115,17 +114,13 @@ class KVNode:
         self.heartbeat_counter = 0
         self.heartbeat_table: dict[str, tuple[int, float]] = {}
 
-    def local_put(self, key: str, value: object, vector_clock: VectorClock, is_tombstone: bool = False) -> VectorClock:
+    def local_put(self, key: str, value: object, vector_clock: VectorClock,
+                  is_tombstone: bool = False, current_time: float = 0.0) -> VectorClock:
         new_vc = vector_clock.increment(self.node_id)
-        new_version = VersionedValue(value, new_vc, time.time(), is_tombstone)
+        new_version = VersionedValue(value, new_vc, current_time, is_tombstone)
         existing = self.store.get(key, [])
-        # Remove versions dominated by the new one; keep concurrent ones
         survivors = [v for v in existing if not new_vc.dominates(v.vector_clock)]
-        # If any existing version dominates the new write, still add (let caller handle)
-        dominated_by_existing = any(v.vector_clock.dominates(new_vc) for v in survivors)
-        if not dominated_by_existing:
-            survivors.append(new_version)
-        else:
+        if not any(v.vector_clock.dominates(new_vc) for v in survivors):
             survivors.append(new_version)
         self.store[key] = survivors
         return new_vc
@@ -153,9 +148,9 @@ class KVNode:
             data[key] = content
         return MerkleTree(data)
 
-    def heartbeat_tick(self):
+    def heartbeat_tick(self, current_time: float = 0.0):
         self.heartbeat_counter += 1
-        self.heartbeat_table[self.node_id] = (self.heartbeat_counter, time.time())
+        self.heartbeat_table[self.node_id] = (self.heartbeat_counter, current_time)
 
     def receive_gossip(self, other_table: dict[str, tuple[int, float]]):
         for node_id, (counter, ts) in other_table.items():
@@ -235,16 +230,15 @@ class KVStore:
                     break
         return result
 
-    def add_node(self, node_id: str):
+    def add_node(self, node_id: str, current_time: float = 0.0):
         node = KVNode(node_id)
         self.nodes[node_id] = node
         self.node_status[node_id] = "ALIVE"
-        # Initialize heartbeat table
-        node.heartbeat_tick()
+        node.heartbeat_tick(current_time)
         for other_id, other_node in self.nodes.items():
             if other_id != node_id:
-                node.heartbeat_table[other_id] = (0, time.time())
-                other_node.heartbeat_table[node_id] = (0, time.time())
+                node.heartbeat_table[other_id] = (0, current_time)
+                other_node.heartbeat_table[node_id] = (0, current_time)
         self._build_ring()
 
     def remove_node(self, node_id: str):
@@ -263,36 +257,33 @@ class KVStore:
     def _is_node_available(self, node_id: str) -> bool:
         return self.node_status.get(node_id) == "ALIVE"
 
-    def put(self, key: str, value: object, context: VectorClock = None) -> VectorClock:
+    def put(self, key: str, value: object, context: VectorClock = None,
+            current_time: float = 0.0) -> VectorClock:
         if context is None:
             context = VectorClock()
         pref_list = self._get_preference_list(key, self.n + len(self.nodes))
         target_nodes = pref_list[:self.n]
         backup_nodes = pref_list[self.n:]
 
+        coordinator = target_nodes[0] if target_nodes else list(self.nodes.keys())[0]
+        new_vc = context.increment(coordinator)
+        vv = VersionedValue(value, new_vc, current_time)
+
         successful_writes = 0
-        result_vc = context
         for node_id in target_nodes:
             if self._is_node_available(node_id):
-                vc = self.nodes[node_id].local_put(key, value, context)
-                result_vc = vc
+                self.nodes[node_id].local_put_raw(key, vv)
                 successful_writes += 1
             else:
-                # Hinted handoff
-                vc = context.increment(node_id)
-                vv = VersionedValue(value, vc, time.time())
                 self.hinted_handoff.store_hint(node_id, key, vv)
-                # Write to a backup node
                 for backup_id in backup_nodes:
                     if self._is_node_available(backup_id) and backup_id not in target_nodes:
                         self.nodes[backup_id].local_put_raw(key, vv)
                         break
-                result_vc = vc
-                successful_writes += 1  # Count hinted as success
 
         if successful_writes < self.w:
             raise Exception(f"Write quorum not met: needed {self.w}, got {successful_writes}")
-        return result_vc
+        return new_vc
 
     def get(self, key: str) -> list[tuple[object, VectorClock]]:
         pref_list = self._get_preference_list(key, self.n)
@@ -336,47 +327,47 @@ class KVStore:
                 seen.append(vc_key)
                 deduped.append(v)
 
-        # Read repair: push latest to stale replicas
-        if deduped:
-            best = deduped[0]
+        # Read repair: push all surviving versions to stale replicas
+        for version in deduped:
             for node_id, node_versions in responding_nodes:
-                node_has_best = any(
-                    v.vector_clock.counters == best.vector_clock.counters
+                node_has_version = any(
+                    v.vector_clock.counters == version.vector_clock.counters
                     for v in node_versions
                 )
-                if not node_has_best:
-                    self.nodes[node_id].local_put_raw(key, best)
+                if not node_has_version:
+                    self.nodes[node_id].local_put_raw(key, version)
 
         return [(v.value, v.vector_clock) for v in deduped]
 
-    def delete(self, key: str, context: VectorClock = None) -> VectorClock:
+    def delete(self, key: str, context: VectorClock = None,
+               current_time: float = 0.0) -> VectorClock:
         if context is None:
             context = VectorClock()
         pref_list = self._get_preference_list(key, self.n)
-        result_vc = context
+        coordinator = pref_list[0] if pref_list else list(self.nodes.keys())[0]
+        new_vc = context.increment(coordinator)
+        vv = VersionedValue(None, new_vc, current_time, is_tombstone=True)
+
         successful = 0
         for node_id in pref_list:
             if self._is_node_available(node_id):
-                vc = self.nodes[node_id].local_put(key, None, context, is_tombstone=True)
-                result_vc = vc
+                self.nodes[node_id].local_put_raw(key, vv)
                 successful += 1
         if successful < self.w:
             raise Exception(f"Delete quorum not met: needed {self.w}, got {successful}")
-        return result_vc
+        return new_vc
 
-    def run_gossip_round(self):
+    def run_gossip_round(self, current_time: float = 0.0):
         alive_nodes = [nid for nid in self.nodes if self._is_node_available(nid)]
         for node_id in alive_nodes:
             node = self.nodes[node_id]
-            node.heartbeat_tick()
+            node.heartbeat_tick(current_time)
             peers = [n for n in alive_nodes if n != node_id]
             if peers:
                 targets = random.sample(peers, min(2, len(peers)))
                 for target_id in targets:
                     self.nodes[target_id].receive_gossip(node.heartbeat_table)
 
-        # Update suspicion states
-        now = time.time()
         for node_id in self.nodes:
             if self.node_status[node_id] == "DOWN":
                 continue
@@ -386,7 +377,7 @@ class KVStore:
                 entry = node.heartbeat_table.get(node_id)
                 if entry:
                     _, ts = entry
-                    age = now - ts
+                    age = current_time - ts
                     if age > self.down_timeout:
                         self.node_status[node_id] = "DOWN"
                     elif age > self.suspect_timeout:
