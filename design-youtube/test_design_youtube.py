@@ -187,3 +187,33 @@ def test_dag_cycle_detection():
 
     with pytest.raises(ValueError, match="cycle"):
         dag.get_execution_order()
+
+
+def test_dag_re_execution():
+    """DAG can be executed multiple times with fresh stage status."""
+    dag = ProcessingDAG()
+    dag.add_stage(ProcessingStage("a", handler=lambda ctx: True))
+    dag.add_stage(ProcessingStage("b", handler=lambda ctx: True, dependencies=["a"]))
+
+    result1 = dag.execute({})
+    assert result1["a"] == StageStatus.COMPLETED
+    result2 = dag.execute({})
+    assert result2["a"] == StageStatus.COMPLETED
+
+
+def test_engagement_metrics():
+    """Watch duration percentage is tracked per video."""
+    counter = ViewCounter()
+    counter.record_view("vid_1", "viewer_1", watch_percentage=80.0)
+    counter.record_view("vid_1", "viewer_2", watch_percentage=60.0)
+    counter.record_view("vid_1", "viewer_3", watch_percentage=100.0)
+    avg = counter.get_average_watch_percentage("vid_1")
+    assert abs(avg - 80.0) < 0.01
+
+
+def test_tag_substring_search():
+    """Tag search uses substring matching, not exact match."""
+    store = VideoStore()
+    v1 = store.upload("Video", "", "u1", 60, tags=["cats", "funny"])
+    results = store.search("cat")
+    assert any(r.video_id == v1.video_id for r in results)

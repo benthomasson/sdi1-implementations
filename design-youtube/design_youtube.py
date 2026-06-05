@@ -3,7 +3,6 @@
 import hashlib
 import math
 import random
-import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -129,6 +128,8 @@ class ProcessingDAG:
 
     def execute(self, context: dict) -> dict[str, StageStatus]:
         """Execute stages in topological order."""
+        for stage in self.stages.values():
+            stage.status = StageStatus.PENDING
         levels = self.get_execution_order()
         failed_stages = set()
 
@@ -241,17 +242,19 @@ class VideoUploadPipeline:
 # --- Approximate Counters ---
 
 class MorrisCounter:
-    """Probabilistic counter using O(log log n) space."""
+    """Probabilistic counter using Morris+ (averaged independent counters)."""
 
-    def __init__(self):
-        self.X = 0.0
+    def __init__(self, num_counters: int = 32):
+        self.counters = [0.0] * num_counters
 
     def increment(self):
-        if random.random() < 1.0 / (2 ** self.X):
-            self.X += 1
+        for i in range(len(self.counters)):
+            if random.random() < 1.0 / (2 ** self.counters[i]):
+                self.counters[i] += 1
 
     def estimate(self) -> int:
-        return int(2 ** self.X - 1)
+        estimates = [2 ** x - 1 for x in self.counters]
+        return int(sum(estimates) / len(estimates))
 
 
 class HyperLogLogCounter:
@@ -293,20 +296,22 @@ class HyperLogLogCounter:
 
 
 class ViewCounter:
-    """Combines exact and approximate counting."""
+    """Combines exact and approximate counting with engagement metrics."""
 
     def __init__(self):
         self.exact_counts: dict[str, int] = defaultdict(int)
         self.morris_counters: dict[str, MorrisCounter] = {}
         self.hll_counters: dict[str, HyperLogLogCounter] = {}
+        self.watch_percentages: dict[str, list[float]] = defaultdict(list)
 
-    def record_view(self, video_id: str, viewer_id: str):
+    def record_view(self, video_id: str, viewer_id: str, watch_percentage: float = 100.0):
         self.exact_counts[video_id] += 1
         if video_id not in self.morris_counters:
             self.morris_counters[video_id] = MorrisCounter()
             self.hll_counters[video_id] = HyperLogLogCounter()
         self.morris_counters[video_id].increment()
         self.hll_counters[video_id].add(viewer_id)
+        self.watch_percentages[video_id].append(min(100.0, max(0.0, watch_percentage)))
 
     def get_view_count(self, video_id: str) -> int:
         return self.exact_counts.get(video_id, 0)
@@ -321,6 +326,12 @@ class ViewCounter:
             return self.hll_counters[video_id].estimate()
         return 0
 
+    def get_average_watch_percentage(self, video_id: str) -> float:
+        pcts = self.watch_percentages.get(video_id, [])
+        if not pcts:
+            return 0.0
+        return sum(pcts) / len(pcts)
+
 
 # --- Video Store ---
 
@@ -333,13 +344,13 @@ class VideoStore:
     def upload(self, title: str, description: str, uploader_id: str,
                duration_seconds: float, format: str = "mp4",
                tags: list = None, current_time: float = None) -> Video:
-        video_id = str(uuid.uuid4())[:8]
+        video_id = str(uuid.uuid4())
         video = Video(
             video_id=video_id,
             title=title,
             description=description,
             uploader_id=uploader_id,
-            upload_timestamp=current_time or time.time(),
+            upload_timestamp=current_time if current_time is not None else 0.0,
             duration_seconds=duration_seconds,
             original_format=format,
             tags=tags or [],
@@ -355,7 +366,7 @@ class VideoStore:
         results = []
         for v in self.videos.values():
             if v.status == VideoStatus.READY or v.status == VideoStatus.UPLOADING:
-                if query_lower in v.title.lower() or query_lower in [t.lower() for t in v.tags]:
+                if query_lower in v.title.lower() or any(query_lower in t.lower() for t in v.tags):
                     results.append(v)
         return results[:limit]
 
