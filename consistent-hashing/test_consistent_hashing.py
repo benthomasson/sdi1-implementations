@@ -19,10 +19,8 @@ def test_redistribution_on_add():
     ring.add_node("B")
     ring.add_node("C")
     keys = [f"k{i}" for i in range(10000)]
-    for k in keys:
-        ring.get_node(k)
 
-    moved = ring.add_node("D")
+    moved = ring.add_node("D", keys=keys)
     # ~1/4 of keys should move
     assert 1500 < len(moved) < 3500
 
@@ -33,12 +31,9 @@ def test_redistribution_on_remove():
     ring.add_node("B")
     ring.add_node("C")
     keys = [f"k{i}" for i in range(10000)]
-    for k in keys:
-        ring.get_node(k)
 
-    # Keys owned by B before removal
     owned_by_b = [k for k in keys if ring.get_node(k) == "B"]
-    result = ring.remove_node("B")
+    result = ring.remove_node("B", keys=keys)
     assert set(result.keys()) == set(owned_by_b)
     for key, new_owner in result.items():
         assert new_owner in ["A", "C"]
@@ -151,7 +146,7 @@ def test_keys_not_moved_stay():
     keys = [f"k{i}" for i in range(1000)]
     before = {k: ring.get_node(k) for k in keys}
 
-    moved = set(ring.add_node("C"))
+    moved = set(ring.add_node("C", keys=keys))
     for k in keys:
         if k not in moved:
             assert ring.get_node(k) == before[k]
@@ -175,8 +170,8 @@ def test_stats():
     stats = ring.get_stats()
     assert stats["num_physical_nodes"] == 3
     assert stats["num_virtual_nodes"] == 300
-    assert "std_dev" in stats
-    assert stats["std_dev"] > 0
+    assert "load_std_dev" in stats
+    assert stats["load_std_dev"] > 0
 
 
 def test_replication_clockwise_order():
@@ -188,3 +183,29 @@ def test_replication_clockwise_order():
     replicas = ring.get_nodes("test-key", n=3)
     # First replica should be same as get_node
     assert replicas[0] == ring.get_node("test-key")
+
+
+def test_hash_collision_skipped():
+    """Virtual nodes with colliding positions are skipped, not overwritten."""
+    collision_pos = 42
+
+    call_count = [0]
+    def colliding_hash(key: str) -> int:
+        call_count[0] += 1
+        if call_count[0] <= 3:
+            return collision_pos
+        return hash(key) % (2**32)
+
+    ring = ConsistentHashRing(num_virtual_nodes=3, hash_fn=colliding_hash)
+    ring.add_node("A")
+    # A gets position 42 on first vnode, then two more at 42 (skipped)
+    assert len(ring._node_positions["A"]) == 1
+
+    # Reset and add B — its first vnode also collides at 42, should be skipped
+    call_count[0] = 0
+    ring.add_node("B")
+    assert collision_pos not in ring._node_positions["B"]
+
+    # Removing B should not corrupt A's position
+    ring.remove_node("B")
+    assert ring.get_node("test") == "A"

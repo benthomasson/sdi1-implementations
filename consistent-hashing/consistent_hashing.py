@@ -20,7 +20,6 @@ class ConsistentHashRing:
         self._sorted_positions: list[int] = []
         self._position_to_node: dict[int, str] = {}
         self._node_positions: dict[str, list[int]] = {}
-        self._keys: set[str] = set()
 
     @property
     def nodes(self) -> list[str]:
@@ -35,49 +34,44 @@ class ConsistentHashRing:
             idx = 0
         return idx
 
-    def add_node(self, node_id: str) -> list[str]:
-        """Add a physical node. Returns list of keys that would move to this node."""
+    def add_node(self, node_id: str, keys: list[str] = None) -> list[str]:
+        """Add a physical node. If keys provided, returns list of keys that would move to this node."""
         if node_id in self._node_positions:
             return []
 
-        # Record old owners for tracked keys
-        old_owners = {}
-        for key in self._keys:
-            old_owners[key] = self.get_node(key) if self._sorted_positions else None
+        if keys:
+            old_owners = {k: self.get_node(k) for k in keys} if self._sorted_positions else {}
 
-        # Add virtual nodes
         positions = []
         for i in range(self.num_virtual_nodes):
             pos = self.hash_fn(f"{node_id}#{i}")
+            if pos in self._position_to_node:
+                continue
             positions.append(pos)
             self._position_to_node[pos] = node_id
             bisect.insort(self._sorted_positions, pos)
         self._node_positions[node_id] = positions
 
-        # Find keys that moved to the new node
-        moved = []
-        for key in self._keys:
-            new_owner = self.get_node(key)
-            if new_owner == node_id and old_owners.get(key) != node_id:
-                moved.append(key)
-        return moved
+        if not keys:
+            return []
+        return [k for k in keys if self.get_node(k) == node_id and old_owners.get(k) != node_id]
 
-    def remove_node(self, node_id: str) -> dict[str, str]:
-        """Remove a physical node. Returns {key: new_owner_node} for redistributed keys."""
+    def remove_node(self, node_id: str, keys: list[str] = None) -> dict[str, str]:
+        """Remove a physical node. If keys provided, returns {key: new_owner_node} for redistributed keys."""
         if node_id not in self._node_positions:
             return {}
 
-        # Find keys owned by this node before removal
-        affected_keys = [k for k in self._keys if self.get_node(k) == node_id]
+        if keys:
+            affected_keys = [k for k in keys if self.get_node(k) == node_id]
 
-        # Remove virtual nodes
         for pos in self._node_positions[node_id]:
             del self._position_to_node[pos]
             idx = bisect.bisect_left(self._sorted_positions, pos)
             self._sorted_positions.pop(idx)
         del self._node_positions[node_id]
 
-        # Map affected keys to new owners
+        if not keys:
+            return {}
         result = {}
         for key in affected_keys:
             if self._sorted_positions:
@@ -88,7 +82,6 @@ class ConsistentHashRing:
         """Get the primary node responsible for this key."""
         if not self._sorted_positions:
             raise ValueError("No nodes in the ring")
-        self._keys.add(key)
         idx = self._get_position(key)
         return self._position_to_node[self._sorted_positions[idx]]
 
@@ -96,7 +89,6 @@ class ConsistentHashRing:
         """Get n distinct physical nodes for replication (clockwise walk)."""
         if not self._sorted_positions:
             raise ValueError("No nodes in the ring")
-        self._keys.add(key)
         n = min(n, len(self._node_positions))
         result = []
         seen = set()
@@ -121,27 +113,29 @@ class ConsistentHashRing:
         return dist
 
     def get_stats(self) -> dict:
-        """Return ring statistics."""
+        """Return ring statistics including per-node load share based on ring ownership."""
         positions = self._sorted_positions
         num_vnodes = len(positions)
         num_pnodes = len(self._node_positions)
 
-        if num_vnodes < 2:
-            std_dev = 0.0
+        if num_pnodes < 2:
+            load_std_dev = 0.0
         else:
-            # Compute gaps between consecutive virtual nodes
-            gaps = []
+            ring_size = 2**32
+            node_ownership: dict[str, int] = {n: 0 for n in self._node_positions}
             for i in range(num_vnodes):
-                gap = (positions[(i + 1) % num_vnodes] - positions[i]) % (2**32)
-                gaps.append(gap)
-            mean_gap = sum(gaps) / len(gaps)
-            variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
-            std_dev = math.sqrt(variance)
+                gap = (positions[(i + 1) % num_vnodes] - positions[i]) % ring_size
+                node = self._position_to_node[positions[(i + 1) % num_vnodes]]
+                node_ownership[node] += gap
+            shares = [v / ring_size for v in node_ownership.values()]
+            mean_share = sum(shares) / len(shares)
+            variance = sum((s - mean_share) ** 2 for s in shares) / len(shares)
+            load_std_dev = math.sqrt(variance)
 
         return {
             "num_physical_nodes": num_pnodes,
             "num_virtual_nodes": num_vnodes,
-            "std_dev": std_dev,
+            "load_std_dev": load_std_dev,
         }
 
 
