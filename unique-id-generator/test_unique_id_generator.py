@@ -12,7 +12,7 @@ from unique_id_generator import (
 )
 
 
-def make_clock(start_ms=1_700_000_000_000, step_ms=0):
+def make_clock(start_ms=1_710_000_000_000, step_ms=0):
     """Create a deterministic clock function returning seconds."""
     state = {"ms": start_ms}
     def clock():
@@ -39,14 +39,14 @@ def test_snowflake_monotonic():
 
 # 3. Snowflake parse correctly extracts all fields
 def test_snowflake_parse():
-    clock = make_clock(start_ms=1_700_000_000_123)
+    clock = make_clock(start_ms=1_710_000_000_123)
     gen = SnowflakeGenerator(datacenter_id=7, worker_id=12, clock_fn=clock)
     id1 = gen.generate()
     parsed = SnowflakeGenerator.parse(id1)
     assert parsed["datacenter_id"] == 7
     assert parsed["worker_id"] == 12
     assert parsed["sequence"] == 0
-    assert parsed["timestamp_ms"] == 1_700_000_000_123
+    assert parsed["timestamp_ms"] == 1_710_000_000_123
 
 
 # 4. Snowflake handles sequence overflow (waits for next ms)
@@ -56,8 +56,8 @@ def test_snowflake_sequence_overflow():
         call_count["n"] += 1
         # First 4097 calls return same ms, then advance
         if call_count["n"] <= 4097:
-            return 1_700_000_000.000
-        return 1_700_000_001.000  # next second
+            return 1_710_000_000.000
+        return 1_710_000_001.000  # next second
 
     gen = SnowflakeGenerator(datacenter_id=0, worker_id=0, clock_fn=clock)
     ids = []
@@ -73,7 +73,7 @@ def test_snowflake_sequence_overflow():
 
 # 5. Snowflake detects backward clock
 def test_snowflake_backward_clock():
-    times = iter([1_700_000_001.0, 1_700_000_000.0])
+    times = iter([1_710_000_001.0, 1_710_000_000.0])
     gen = SnowflakeGenerator(datacenter_id=0, worker_id=0, clock_fn=lambda: next(times))
     gen.generate()
     with pytest.raises(RuntimeError, match="Clock moved backward"):
@@ -161,7 +161,7 @@ def test_ulid_format():
 
 # 11. ULID is lexicographically sortable by time
 def test_ulid_sortable():
-    clock = make_clock(start_ms=1_700_000_000_000, step_ms=1)
+    clock = make_clock(start_ms=1_710_000_000_000, step_ms=1)
     gen = ULIDGenerator(clock_fn=clock)
     ids = gen.generate_batch(100)
     assert ids == sorted(ids)
@@ -169,7 +169,7 @@ def test_ulid_sortable():
 
 # 12. Coordinator distributes across generators round-robin
 def test_coordinator_round_robin():
-    clock = make_clock(start_ms=1_700_000_000_000)
+    clock = make_clock(start_ms=1_710_000_000_000)
     generators = [
         SnowflakeGenerator(datacenter_id=0, worker_id=i, clock_fn=clock)
         for i in range(3)
@@ -194,7 +194,7 @@ def test_batch_unique():
 
 # 14. Flake ID hex strings are time-sortable
 def test_flake_id_sortable():
-    clock = make_clock(start_ms=1_700_000_000_000, step_ms=1)
+    clock = make_clock(start_ms=1_710_000_000_000, step_ms=1)
     gen = FlakeIDGenerator(worker_id=1, clock_fn=clock)
     ids = gen.generate_batch(100)
     assert ids == sorted(ids)
@@ -204,7 +204,7 @@ def test_flake_id_sortable():
 
 # 15. IDs from different workers in same millisecond are still unique
 def test_different_workers_same_ms_unique():
-    clock = make_clock(start_ms=1_700_000_000_000)
+    clock = make_clock(start_ms=1_710_000_000_000)
     generators = [
         SnowflakeGenerator(datacenter_id=0, worker_id=i, clock_fn=clock)
         for i in range(5)

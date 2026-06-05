@@ -64,6 +64,9 @@ class SnowflakeGenerator(IDGenerator):
     def generate(self) -> int:
         with self._lock:
             ts = self._current_ms()
+            if ts < self.epoch_ms:
+                raise RuntimeError(
+                    f"Clock is before epoch: {ts} < {self.epoch_ms}")
             if ts < self._last_timestamp_ms:
                 raise RuntimeError(
                     f"Clock moved backward: {self._last_timestamp_ms} -> {ts}")
