@@ -1,9 +1,9 @@
 """Notification system with multi-channel delivery, priority queues, rate limiting, and retry."""
 
+import datetime
 import heapq
 import random
 import re
-import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -210,7 +210,7 @@ class NotificationService:
 
     def send(self, notification: Notification, current_time: float = None) -> str:
         """Enqueue a notification for delivery."""
-        current_time = current_time or time.time()
+        current_time = current_time if current_time is not None else 0.0
         notification.created_at = current_time
         self._update_status(notification, DeliveryStatus.PENDING, current_time)
 
@@ -242,8 +242,7 @@ class NotificationService:
         if not prefs or not prefs.quiet_hours:
             return False
         start, end = prefs.quiet_hours
-        import datetime
-        hour = datetime.datetime.fromtimestamp(current_time).hour
+        hour = datetime.datetime.fromtimestamp(current_time, datetime.UTC).hour
         if start > end:  # overnight, e.g., 22-8
             return hour >= start or hour < end
         return start <= hour < end
@@ -258,7 +257,7 @@ class NotificationService:
 
     def process_queue(self, current_time: float = None) -> int:
         """Process all queued notifications. Returns count of delivered."""
-        current_time = current_time or time.time()
+        current_time = current_time if current_time is not None else 0.0
         delivered = 0
         deferred = []
 

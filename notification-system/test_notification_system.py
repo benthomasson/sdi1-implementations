@@ -166,27 +166,25 @@ def test_user_opt_out():
 
 # 10. Quiet hours prevent delivery during configured hours
 def test_quiet_hours():
+    import calendar, datetime
     service = make_service()
     service.set_user_preferences(UserPreferences(
         user_id="u1", quiet_hours=(22, 8)
     ))
-    # 23:00 UTC = timestamp where hour=23 (within quiet hours 22-8)
-    import datetime
-    # Create a timestamp at 23:00
+    # 23:00 UTC
     dt = datetime.datetime(2024, 1, 1, 23, 0, 0)
-    ts = dt.timestamp()
+    ts = calendar.timegm(dt.timetuple())
 
     service.send(Notification(
         id="q1", user_id="u1", channel=Channel.PUSH,
         priority=Priority.NORMAL, raw_content={"msg": "late night"}
     ), current_time=ts)
     service.process_queue(current_time=ts)
-    # Should still be queued, not delivered
     assert service.get_status("q1") != DeliveryStatus.DELIVERED
 
-    # At 10:00, should deliver
+    # 10:00 UTC
     dt2 = datetime.datetime(2024, 1, 2, 10, 0, 0)
-    ts2 = dt2.timestamp()
+    ts2 = calendar.timegm(dt2.timetuple())
     service.process_queue(current_time=ts2)
     assert service.get_status("q1") == DeliveryStatus.DELIVERED
 
@@ -316,3 +314,40 @@ def test_spec_example_priority():
     service.process_queue(current_time=100.0)
     push_log = service.channels[Channel.PUSH].get_sent_log()
     assert push_log[0]["notification_id"] == "critical"
+
+
+# 18. current_time=0.0 is treated as valid, not as missing
+def test_current_time_zero():
+    service = make_service()
+    service.send(Notification(
+        id="z1", user_id="u1", channel=Channel.PUSH,
+        priority=Priority.NORMAL, raw_content={"msg": "zero time"}
+    ), current_time=0.0)
+    service.process_queue(current_time=0.0)
+    assert service.get_status("z1") == DeliveryStatus.DELIVERED
+    notif = service._notifications["z1"]
+    assert notif.created_at == 0.0
+
+
+# 19. Quiet hours work correctly regardless of system timezone
+def test_quiet_hours_utc():
+    import calendar, datetime
+    service = make_service()
+    service.set_user_preferences(UserPreferences(
+        user_id="u1", quiet_hours=(0, 6)
+    ))
+    # 03:00 UTC — within quiet hours
+    dt = datetime.datetime(2024, 6, 15, 3, 0, 0)
+    ts = calendar.timegm(dt.timetuple())
+    service.send(Notification(
+        id="qz1", user_id="u1", channel=Channel.PUSH,
+        priority=Priority.NORMAL, raw_content={"msg": "early morning"}
+    ), current_time=ts)
+    service.process_queue(current_time=ts)
+    assert service.get_status("qz1") != DeliveryStatus.DELIVERED
+
+    # 07:00 UTC — outside quiet hours
+    dt2 = datetime.datetime(2024, 6, 15, 7, 0, 0)
+    ts2 = calendar.timegm(dt2.timetuple())
+    service.process_queue(current_time=ts2)
+    assert service.get_status("qz1") == DeliveryStatus.DELIVERED
